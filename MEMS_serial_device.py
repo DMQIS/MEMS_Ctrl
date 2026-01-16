@@ -177,7 +177,7 @@ class MEMS_device():
     ## Points the mirror at a given X/Y position
     def set_mirror_position(self, x, y, verbose=True):        
         if(x<-1 or y<-1 or x>1 or y>1):
-            print("Error: invalid selection. X, y should be values in range [0,1]\n")
+            print("Error: invalid selection. X, y should be values in range [-1,1]\n")
             return False
         if not self.is_HV_on and verbose:
             print("Note that driver state is OFF right now.")
