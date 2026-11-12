@@ -1,6 +1,64 @@
 # MEMS Serial Device Control w/ Python
 The MEMS_device class contains python wrappers for USB serial communication with the MEMS driver.
 
+### Connection and shutdown behavior (updated November 12, 2026)
+
+Use Python 3.11 or newer with `pyserial`.
+Importing the module does not open a port. Creating `MEMS_device(port="COM4")`
+actively opens the port, requires an MTI identity response, sends `MTI+DI` to
+disable the driver, and queries `MTI+GP`. It never enables HV or sends position
+or mirror-setting commands during connection. COM4 must still identify the
+intended controller; it is not a permanently assigned device identity.
+
+State starts as `unknown`. The wrapper distinguishes an acknowledged command
+from controller parameter readback. Only a clearly labeled `MEMSDriverEnable`
+field is interpreted; unfamiliar responses are retained as raw text. The actual
+firmware's response must establish whether that readback is available. Neither
+level measures physical output voltage. `is_HV_on` can therefore be `None`.
+
+Invalid inputs raise `ValueError`; communication/state failures raise
+`MEMSError` (transport failures may also raise serial/OSError exceptions).
+After uncertain communication, motion and setting changes are blocked. A
+disable is still attempted during cleanup, but a late generic acknowledgment
+after a timeout is not accepted as proof of shutdown. Reconnect to reestablish
+the protocol. An unrecognized login response, including an already-in-command-
+mode error without identity, rejects initialization rather than guessing.
+
+Each connection owns its settings and position cache. Existing getter methods
+return explicitly labeled cached settings/commanded position. Use
+`read_controller_params()` for a fresh parameter response. No physical mirror
+position measurement is provided.
+
+`exit_safely()` now disables without parking by default. Use
+`exit_safely(park=True)` only when returning to center is intended. A parking
+failure still attempts disable and remains a failure in `last_shutdown_report`.
+Failed disable does not logout or close the port; inspect the report and retry
+explicitly. `close()` only releases the port and must not be used as shutdown.
+The `with` form attempts cleanup on ordinary exceptions and notebook interrupts;
+it cannot guarantee cleanup after process termination, power loss, or a broken
+USB connection. The standalone diagnostic releases its port on termination
+even on failure and explicitly records that shutdown was incomplete.
+
+Before calling `HV_on()` in an existing notebook, explicitly command an initial
+position while disabled, after setting the mirror parameters, for example
+`mems.set_mirror_position(0, 0)`. No automatic enable occurs. The agreed working
+settings from `MEMS_demo.ipynb` are 90 V bias, 180 V maximum differential, and
+120 Hz filter; the communication-only diagnostic does not apply them.
+Notebook cells already loaded in a kernel keep the old class definition until
+reloaded. Safely finish the existing session before reloading/reconnecting.
+
+Run offline fault-injection checks (no hardware backend is used):
+
+```shell
+python -B checks/offline_safety_check.py
+```
+
+Current regression results are saved to `checks/safe_wrapper_results.json`.
+Generated reports remain local and are excluded from version control.
+The opt-in `checks/controller_connection_check.py` limits outgoing commands to
+login, disable, parameter query, and logout, and verifies the selected USB
+serial number before opening the port. Each live run saves a dated transcript.
+
 This setup is quite basic, but a workflow description is included below.  Demo code is provided in the notebook  `MEMS_demo.ipynb`
 
 ### Install Dependencies
@@ -43,9 +101,13 @@ Control of mirror movement speed is not yet supported. I have not yet found a se
 
 
 ### Step Five: Shut things down
-`.exit_safely()` is set up to put the mirror into a safe state, turn off the HV, take the driver out of serial mode, and finally shut down the serial port connection
+`.exit_safely()` attempts to disable HV, checks the available controller evidence,
+then logs out and closes the port. It returns `False` on failure; inspect
+`last_shutdown_report`. Parking is optional (`park=True`) and never prevents a
+disable attempt. See the updated behavior above.
 
-**TO AVOID DAMAGE TO THE MIRRORS, USE THIS FUNCTION TO POWER OFF AND SAFELY TERMINATE THE CONNECTION.**
+**Check the shutdown result before disconnecting hardware. A function name or
+successful port closure does not prove the output voltage is zero.**
 
 **DO NOT UNPLUG THE USB OR SHUT DOWN THE JUPYTER NOTEBOOK WHILE THE MEMS MIRROR IS BIASED.**
  

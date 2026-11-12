@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+
+# Locally generated diagnostics contain machine and device identifiers.
+/checks/*_results.json
+/checks/passive_device_inventory.json
+/checks/controller_connection_*.json

@@ -1,285 +1,412 @@
-#----------------------------------------------------------------------
-#
-# MEMS_driver.py
-# author: Hannah Magoon
-# April 2023
-#
-# Base class for serial connection to MEMS mirror driver
-#
-#----------------------------------------------------------------------
+"""Mirrorcle control: identify, disable on connect, and retain state evidence.
 
-import serial  ## If you are installing this using pip, make sure to get "pyserial" and NOT "serial"
-from time import sleep
+Importing this module does not open a port. Construction actively identifies and
+disables the controller. Acknowledgments/readback are not voltage measurements.
+"""
+import math
+import re
+import threading
+from functools import wraps
+from numbers import Real
+from time import monotonic, sleep
+
+import serial
 
 
-## Handles serial comminucation to MEMS driver
-class MEMS_device():
-    is_HV_on = False
-    
-    settings = {"Vbias"    : None,
-        "VdifferenceMax"   : None,
-        "HardwareFilterBW" : None}
-    
-    position = {
-        "x" : 0,
-        "y" : 0}
-        
+class MEMSError(RuntimeError):
+    """Operation could not be established as successful."""
 
-    ## Arguments: 
-    ##  timeout    => wait time for serial response readin- Zero seems fine
-    ##  sleep_time => delay between sending commands. Must be nonzero, 0.2 seems fine
-    def __init__(self,port, timeout=0, sleep_time=0.2, verbose=True):
+
+class MEMSCommunicationError(MEMSError):
+    pass
+
+
+class MEMSShutdownError(MEMSError):
+    pass
+
+
+def _locked(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
+class MEMS_device:
+    def __init__(self, port, timeout=0, sleep_time=0.2, verbose=True,
+                 *, response_timeout=None, _serial_factory=None):
+        self._lock = threading.RLock()
+        self.response_timeout = response_timeout if response_timeout is not None else (timeout or 2.0)
+        if not math.isfinite(self.response_timeout) or self.response_timeout <= 0:
+            raise ValueError("response_timeout must be finite and positive")
+        if not math.isfinite(sleep_time) or sleep_time < 0:
+            raise ValueError("sleep_time must be finite and nonnegative")
         self.sleep_time = sleep_time
-        ## Instantiate connection object
-        self.ser = serial.Serial(port=port, baudrate=115200, timeout=timeout, 
-                                 rtscts=0, xonxoff=1, dsrdtr=0)
-        ser = self.ser  
-        ## Sign in to device
-        ser.write(b'$MTI$\n')
-        sleep(self.sleep_time)
-        
-        ## Read in a message, see if it worked
-        resp = ser.readline()
-        if resp == (b''):
-            print("Connection unsuccessful: no MEMS driver found on port:", ser.name)
-            print("To check USB connections, open a terminal and run the command:")
-            print("    ls -l /dev/serial/by-id")
-            print("To check port permissions, open a terminal and run the command:")
-            print("    ls -l /dev/insert_your_port_name_here")
-            print("See readme for additional guidance")
-        ## Note that you get "invalid command" if the device is already logged onto. this is fine.
-        elif verbose and (resp != b'MTI-ERR InvalidCommand\r\n'): print(resp.decode())
-    
+        self._quiet_time = max(0.02, sleep_time)
+        self.settings = dict(Vbias=None, VdifferenceMax=None, HardwareFilterBW=None)
+        self.position = dict(x=None, y=None)
+        self.output_state = "unknown"
+        self.state_evidence = "No controller response yet"
+        self.identity = None
+        self.transcript = []
+        self.last_controller_params = None
+        self.readback_supported = None
+        self.last_shutdown_report = None
+        self._faulted = False
+        self._ambiguous_reply = False
+        self._shutdown_complete = False
+        factory = _serial_factory or serial.Serial
+        # Configure DTR/RTS before opening; OS/adapter behavior can still vary.
+        self.ser = factory(port=None, baudrate=115200, timeout=min(0.05, self.response_timeout),
+                           write_timeout=self.response_timeout, rtscts=False,
+                           xonxoff=True, dsrdtr=False)
+        self.ser.dtr = False
+        self.ser.rts = False
+        self.ser.port = port
+        try:
+            self.ser.open()
+            self.identity = self._exchange("$MTI$", kind="identity")
+            self.HV_off(verbose=False)
+        except BaseException as exc:
+            if self.identity is not None and self.ser.is_open:
+                try:
+                    self.HV_off(verbose=False)
+                except BaseException as cleanup_error:
+                    exc.add_note("Startup disable retry failed: " + str(cleanup_error))
+            try:
+                self.close()
+            except Exception as close_error:
+                exc.add_note("Port close failed: " + str(close_error))
+            exc.add_note("Initialization failed. Output state must not be assumed off.")
+            exc.device = self
+            raise
+        if verbose:
+            print(self)
 
+    @property
+    def is_HV_on(self):
+        """True, False, or None (unknown), based on protocol evidence only."""
+        if self.output_state.startswith("enabled"):
+            return True
+        if self.output_state.startswith("disabled"):
+            return False
+        return None
 
-
-    ## Lets you print settings
     def __str__(self):
-        print("==------MEMS DRIVER------==")
-        if self.is_HV_on: print("Driver is currently ON")
-        else: print("Driver is currently OFF")
-        print("           Vbias =", self.settings["Vbias"])
-        print("  VdifferenceMax =", self.settings["VdifferenceMax"])
-        print("HardwareFilterBW =", self.settings["HardwareFilterBW"])
-        print("==-----------------------==")
-        return ""
-    
-    
-    
-    ## Note that due to the weird '\n' placement in the some commands, we need to
-    ## specify a number of characters to readin.  250 seems fine so far
-    def _send_cmd(self, cmd, read_n_char=250, print_resp=True, print_cmd=True):
-        ser = self.ser
-        ## Format the command
-        if(type(cmd) != bytes):
-            cmd = bytes(cmd, 'ascii')    
-        if(cmd.decode()[-2:]=="\r\n" or cmd.decode()[-2:] == "\n\r"):
-            cmd = cmd[:-2]
-        if(cmd.decode()[-1:]=="\r"):
-            cmd = cmd[:-1] 
-        if(cmd.decode()[-1] != "\n"):
-            cmd = cmd + b'\n'
-        if print_cmd: print("Sending command:", cmd)
-            
-        ## Send the command
-        ser.write(cmd)
-        sleep(self.sleep_time)
-        
-        ## Get a response
-        resp = ser.read(read_n_char).decode()
-        if print_resp: print("Response:", resp)
-        return resp
-    
-    
-    
-    ## Sets bias voltage to match value from a mirror's datasheet
-    ## Returns 'true' when command sent successfully
-    def set_Vbias(self, Vbias, verbose=True):
-        if (self.is_HV_on):
-            print("Error: cannot change parameters while mirror is on")
-            return False        
-        ## Sanity check the inputs
-        if(type(Vbias)!=int or Vbias<0 or Vbias>100):
-            print("Error: invalid selection. Vbias should be a positive integer in range [0,100]\n")
-            return False
-        ## Send the command
-        if verbose: print("Setting Vbias to", Vbias)
-        cmd = "MTI+VB " + str(Vbias)
-        resp = self._send_cmd(cmd, print_resp=verbose, print_cmd=False)
-        ## Store settings in class
-        if(resp=="MTI-OK\r\n"):
-            self.settings["Vbias"] = Vbias
-            return True
-        return False
-    
-    
-    
-    ## Sets max Vdiff across ctrl lines to match value from a mirror's datasheet
-    ## Returns 'true' when command sent successfully
-    def set_VdifferenceMax(self, VdifferenceMax, verbose=True, safety=True):
-        if (self.is_HV_on):
-            print("Error: cannot change parameters while mirror is on")
-            return False        
-        ## Sanity check the inputs
-        if(type(VdifferenceMax)!=int or VdifferenceMax<0 or VdifferenceMax>200):
-            print("Error: invalid selection. VdifferenceMax should be a positive integer in range [0,200]\n")
-            return False
-        ## Send the command
-        if verbose: print("Setting VdifferenceMax to", VdifferenceMax)
-        cmd = "MTI+VD " + str(VdifferenceMax)
-        resp = self._send_cmd(cmd, print_resp=verbose, print_cmd=False)
-        ## Store settings in class
-        if(resp=="MTI-OK\r\n"):
-            self.settings["VdifferenceMax"] = VdifferenceMax
-            return True
-        else: return False
-    
-    
-    
-    ## Sets HardwareFilterBw to match value from a mirror's datasheet
-    ## Returns 'true' when command sent successfully
-    def set_HardwareFilterBW(self, HardwareFilterBW, verbose=True):
-        if (self.is_HV_on):
-            print("Error: cannot change parameters while mirror is on")
-            return False        
-        if(type(HardwareFilterBW)!=int or HardwareFilterBW<50 or HardwareFilterBW>15000):
-            print("Error: invalid selection. HardwareFilterBW should be a positive integer in range [50,15000]\n")
-            return False
-        ## Send the command
-        if verbose: print("Setting HardwareFilterBW to", HardwareFilterBW)
-        cmd = "MTI+BW " + str(HardwareFilterBW)
-        resp = self._send_cmd(cmd, print_resp=verbose, print_cmd=False)
-        ## Store settings in class
-        if(resp=="MTI-OK\r\n"):
-            self.settings["HardwareFilterBW"] = HardwareFilterBW
-            return True
-        else: return False
-    
-    
-    
-    ## Set all mirror parameters
-    ## Returns 'true' when all parameters set successfully
-    def set_mirror_params(self, Vbias, VdifferenceMax, HardwareFilterBW, verbose=True):
-        cmd1_sent = self.set_Vbias(Vbias)
-        cmd2_sent = self.set_VdifferenceMax(VdifferenceMax)
-        cmd3_sent =self.set_HardwareFilterBW(HardwareFilterBW)
-        return (not(not cmd1_sent or not cmd2_sent or not cmd3_sent))
-    
-    
-    
-    ## Returns mirror parameters
-    def get_mirror_params(self, verbose=True):
-        if verbose: print(self)
-        return self.settings["Vbias"], self.settings["VdifferenceMax"], self.settings["HardwareFilterBW"]
-        
-    
-    
-    ## Points the mirror at a given X/Y position
-    def set_mirror_position(self, x, y, verbose=True):        
-        if(x<-1 or y<-1 or x>1 or y>1):
-            print("Error: invalid selection. X, y should be values in range [-1,1]\n")
-            return False
-        if not self.is_HV_on and verbose:
-            print("Note that driver state is OFF right now.")
-        ## Send the command
-        if verbose: print("Going to position x = ", x, ", y = ", y)
-        cmd = "MTI+GT " + str(x) + " " + str(y) + " 0"
-        resp = self._send_cmd(cmd, print_resp=verbose, print_cmd=False)
-        ## Store settings in class
-        if(resp=="MTI-OK\r\n"):
-            self.position["x"] = x
-            self.position["y"] = y
-            return True
-        
-        
-    ## Returns current mirror position    
-    def get_mirror_position(self, verbose=True):
-        x = self.position["x"]
-        y = self.position["y"]
-        if (verbose and not self.is_HV_on):
-            print("Warning: mirror currently switched off. Position is currently [0,0], but set to go to:")        
-        if verbose: print("Mirror position x =", x)
-        if verbose: print("Mirror position y =", y, "\n")
-        return (x, y)
-    
-    
-    
-    ## Turns on High Voltage (necessary to run the MEMS)
-    ## Returns 'true' when command sent successfully
-    def HV_on(self, verbose=True):
-        [Vbias, Vdiff, HWfilt] = self.get_mirror_params(verbose=False)
-        ## Sanity check
-        for i in [Vbias, Vdiff, HWfilt]:
-            if i==None:
-                print("Error: missing mirror parameters.")
-                print("Set Vbias, VdifferenceMax, and HardwarefilterBW before turning on mirror")
-                return False
-        ## Turn on mirror
-        cmd = "MTI+EN\n"
-        print("Turning High Voltage on")
-        resp = self._send_cmd(cmd, print_resp=verbose, print_cmd=False)
-        if(resp=="MTI-OK\r\n"):
-            self.is_HV_on = True
-            return True      
-        return False
-    
-    
-    
-    ## Turns off HV
-    ## Returns 'true' when command sent successfully
+        return (f"MEMS controller: {self.identity or 'unidentified'}\n"
+                f"Output: {self.output_state}; {self.state_evidence}\n"
+                f"Cached settings: {self.settings}\n"
+                f"Last commanded position (not measured): {self.position}")
+
+    def _unknown(self, reason, *, ambiguous=False):
+        self.output_state = "unknown"
+        self.state_evidence = reason
+        self._faulted = True
+        self._ambiguous_reply = self._ambiguous_reply or ambiguous
+
+    def _require_ready(self):
+        if not self.ser.is_open or self._faulted or self.is_HV_on is None:
+            raise MEMSError("Output/communication state is uncertain; motion and settings are blocked. Reconnect to establish state.")
+
+    def _exchange(self, command, *, kind="ack", emergency=False):
+        """Complete lines and bounded waits, with one command outstanding.
+
+        There are no transaction IDs. After a timeout, a late generic OK cannot
+        prove that an emergency disable succeeded. Reconnect before proceeding.
+        """
+        command = command.rstrip("\r\n")
+        if not command or "\n" in command or "\r" in command:
+            raise ValueError("Exactly one nonempty serial command is required")
+        if not self.ser.is_open:
+            self._unknown("Serial port is closed", ambiguous=True)
+            raise MEMSCommunicationError(self.state_evidence)
+        if self._faulted and not emergency:
+            raise MEMSCommunicationError("Communication is faulted; only a disable attempt is allowed")
+        entry = {"command": command, "response": "", "outcome": "pending"}
+        self.transcript.append(entry)
+        buffer, received, lines = bytearray(), bytearray(), []
+        started = last_byte = monotonic()
+        try:
+            self.ser.reset_input_buffer()
+            packet = command.encode("ascii") + b"\n"
+            if self.ser.write(packet) != len(packet):
+                raise MEMSCommunicationError("Incomplete serial write")
+            while monotonic() - started < self.response_timeout:
+                chunk = self.ser.read(1)
+                if chunk:
+                    last_byte = monotonic()
+                    received.extend(chunk)
+                    buffer.extend(chunk)
+                    if len(received) > 16384:
+                        raise MEMSCommunicationError("Response exceeded 16 KiB")
+                    if chunk != b"\n":
+                        continue
+                    line = buffer.decode("ascii").strip()
+                    buffer.clear()
+                    if not line or line == command:
+                        continue
+                    lines.append(line)
+                    if line.startswith("MTI-ERR"):
+                        if kind == "params" and line == "MTI-ERR InvalidCommand":
+                            entry["outcome"] = "unsupported"
+                            return None
+                        self._unknown("Controller rejected " + command + ": " + line)
+                        entry["outcome"] = "rejected"
+                        raise MEMSCommunicationError(self.state_evidence)
+                    if kind == "identity":
+                        if re.fullmatch(r"MTI-Device MTI-[^\r\n]+Ready in [Cc]ommand [Mm]ode", line):
+                            entry["outcome"] = "success"
+                            return line
+                        raise MEMSCommunicationError("Unrecognized controller identity: " + line)
+                    if kind == "ack":
+                        if line != "MTI-OK":
+                            raise MEMSCommunicationError("Unexpected acknowledgment: " + line)
+                        entry["outcome"] = "success"
+                        return line
+                    if kind == "exit":
+                        if line.lower() != "mti-device exit command mode":
+                            raise MEMSCommunicationError("Unexpected logout response: " + line)
+                        entry["outcome"] = "success"
+                        return line
+                elif kind == "params" and lines and not buffer and monotonic() - last_byte >= self._quiet_time:
+                    if lines == ["MTI-OK"]:
+                        raise MEMSCommunicationError("Parameter query returned only an acknowledgment")
+                    entry["outcome"] = "success"
+                    return "\n".join(lines)
+                else:
+                    sleep(0.001)
+            raise MEMSCommunicationError("Timed out waiting for a complete response to " + command)
+        except BaseException as exc:
+            if entry["outcome"] != "rejected":
+                self._unknown(str(exc) or type(exc).__name__, ambiguous=True)
+                entry["outcome"] = "uncertain"
+            raise
+        finally:
+            entry["response"] = received.decode("ascii", errors="replace")
+
+    @_locked
+    def read_controller_params(self):
+        """Fresh GP response; unfamiliar firmware formats remain raw.
+
+        Only the explicit MEMSDriverEnable key is parsed, never inferred from
+        unnamed numbers. Status readback is not measured output voltage.
+        """
+        raw = self._exchange("MTI+GP", kind="params",
+                             emergency=self._faulted and not self._ambiguous_reply)
+        values = [] if raw is None else re.findall(
+            r"^\s*(?:MTI[-:]\s*)?MEMSDriverEnable\s*[:=]\s*(true|false|0|1)\s*$",
+            raw, flags=re.IGNORECASE | re.MULTILINE)
+        enabled = None
+        field_count = len(re.findall(r"\bMEMSDriverEnable\b", raw or "", re.IGNORECASE))
+        if len(values) == 1 and field_count == 1:
+            enabled = values[0].lower() in ("true", "1")
+        elif values or field_count:
+            self._unknown("Malformed or duplicate MEMSDriverEnable readback")
+            raise MEMSCommunicationError(self.state_evidence)
+        elif self.readback_supported is True:
+            self._unknown("Previously available output-state readback disappeared")
+            raise MEMSCommunicationError(self.state_evidence)
+        self.readback_supported = enabled is not None
+        self.last_controller_params = {"raw": raw, "driver_enabled": enabled}
+        if enabled is not None:
+            self.output_state = "enabled_reported" if enabled else "disabled_reported"
+            self.state_evidence = "Controller parameter readback; output voltage not measured"
+        return dict(self.last_controller_params)
+
+    def _set_output(self, enabled):
+        self._exchange("MTI+EN" if enabled else "MTI+DI", emergency=not enabled)
+        if self._ambiguous_reply:
+            self._unknown("Disable attempted after uncertain communication; a generic OK cannot confirm its outcome")
+            raise MEMSCommunicationError(self.state_evidence)
+        self.output_state = "enabled_acknowledged" if enabled else "disabled_acknowledged"
+        self.state_evidence = "Command acknowledged; independent state readback unavailable"
+        # An explicit error leaves no outstanding reply. Disable may establish
+        # state, but other operations stay blocked until a new connection.
+        result = self.read_controller_params()
+        if result["driver_enabled"] is not None and result["driver_enabled"] != enabled:
+            self._unknown("Controller readback disagrees with the requested output state")
+            raise MEMSCommunicationError(self.state_evidence)
+        return True
+
+    @_locked
     def HV_off(self, verbose=True):
-        cmd = "MTI+DI\n"
-        if verbose: print("Turning High Voltage off")
-        resp = self._send_cmd(cmd, print_resp=verbose, print_cmd=False)
-        if(resp=="MTI-OK\r\n"):
-            self.is_HV_on = False
-            return True
-        return False
-    
-    
-    
-    ## You can toggle on/off serial response messages.  This function turns them on.
-    ## My python scripting assumes that they are always set to on.  
-    ## Nothing written here has the power to turn them off.  So this function should be unnecessary
+        """Always attempt disable, regardless of the last recorded state."""
+        result = self._set_output(False)
+        if verbose:
+            print(self.output_state + ": " + self.state_evidence)
+        return result
+
+    @_locked
+    def HV_on(self, verbose=True):
+        self._require_ready()
+        if any(v is None for v in self.settings.values()):
+            raise MEMSError("Set all three mirror parameters before enabling")
+        if any(v is None for v in self.position.values()):
+            raise MEMSError("Explicitly set an initial position while disabled before enabling")
+        if self.settings["VdifferenceMax"] > 2 * self.settings["Vbias"]:
+            raise MEMSError("VdifferenceMax must not exceed twice Vbias")
+        try:
+            result = self._set_output(True)
+        except BaseException as exc:
+            try:
+                self.HV_off(verbose=False)
+            except BaseException as cleanup_error:
+                exc.add_note("Disable after enable failure failed: " + str(cleanup_error))
+            raise
+        if verbose:
+            print(self.output_state + ": " + self.state_evidence)
+        return result
+
+    @staticmethod
+    def _valid_integer(value, low, high):
+        return type(value) is int and low <= value <= high
+
+    def _set_parameter(self, name, command, value, low, high, verbose):
+        self._require_ready()
+        if self.is_HV_on is not False:
+            raise MEMSError("Parameters may only be changed with the driver disabled")
+        if not self._valid_integer(value, low, high):
+            raise ValueError(f"{name} must be an integer in [{low}, {high}]")
+        self._exchange(f"MTI+{command} {value}")
+        self.settings[name] = value
+        if verbose:
+            print(f"{name} = {value} (acknowledged)")
+        return True
+
+    @_locked
+    def set_Vbias(self, Vbias, verbose=True):
+        return self._set_parameter("Vbias", "VB", Vbias, 0, 100, verbose)
+
+    @_locked
+    def set_VdifferenceMax(self, VdifferenceMax, verbose=True, safety=True):
+        # Retain the legacy keyword; safety checks cannot be disabled.
+        return self._set_parameter("VdifferenceMax", "VD", VdifferenceMax, 0, 200, verbose)
+
+    @_locked
+    def set_HardwareFilterBW(self, HardwareFilterBW, verbose=True):
+        return self._set_parameter("HardwareFilterBW", "BW", HardwareFilterBW, 50, 15000, verbose)
+
+    @_locked
+    def set_mirror_params(self, Vbias, VdifferenceMax, HardwareFilterBW, verbose=True):
+        for name, value, low, high in [("Vbias", Vbias, 0, 100),
+                                     ("VdifferenceMax", VdifferenceMax, 0, 200),
+                                     ("HardwareFilterBW", HardwareFilterBW, 50, 15000)]:
+            if not self._valid_integer(value, low, high):
+                raise ValueError(f"{name} must be an integer in [{low}, {high}]")
+        if VdifferenceMax > 2 * Vbias:
+            raise ValueError("VdifferenceMax must not exceed twice Vbias")
+        self.set_Vbias(Vbias, verbose)
+        self.set_VdifferenceMax(VdifferenceMax, verbose)
+        self.set_HardwareFilterBW(HardwareFilterBW, verbose)
+        return True
+
+    @_locked
+    def get_mirror_params(self, verbose=True):
+        """Legacy API: cached acknowledged settings, not fresh readback."""
+        if verbose:
+            print("Cached settings, not fresh readback:", self.settings)
+        return self.settings["Vbias"], self.settings["VdifferenceMax"], self.settings["HardwareFilterBW"]
+
+    @_locked
+    def set_mirror_position(self, x, y, verbose=True):
+        self._require_ready()
+        if any(v is None for v in self.settings.values()):
+            raise MEMSError("Set mirror parameters before issuing a position command")
+        if not all(isinstance(v, Real) and not isinstance(v, bool) and math.isfinite(v) and -1 <= v <= 1 for v in (x, y)):
+            raise ValueError("X and Y must be finite numbers in [-1, 1]")
+        self._exchange(f"MTI+GT {x} {y} 0")
+        self.position.update(x=x, y=y)
+        if verbose:
+            print(f"Commanded position ({x}, {y}); physical position not measured")
+        return True
+
+    @_locked
+    def get_mirror_position(self, verbose=True):
+        """Last acknowledged command, not a position measurement."""
+        if verbose:
+            print("Last commanded position, not measured:", self.position)
+        return self.position["x"], self.position["y"]
+
+    @_locked
     def troubleshoot(self):
-        cmd = "MTI+EC\n"
-        print("Turning on serial responses")
-        resp = self._send_cmd(cmd, print_resp=True, print_cmd=True)
-        return
-    
-    
-    
-    ## Does some checks, then signs off
-    def exit_safely(self, verbose=True):
-        if verbose: print("Starting Exit Sequence")
-        ## Return mirror to center location
-        xpos, ypos = self.get_mirror_position(verbose=False)
-        if(xpos!= 0 or ypos!=0):
-            if verbose: print("Returning to position [0,0]")
-            did_it_work = self.set_mirror_position(0,0, verbose=False)
-            if not did_it_work:
-                print("Warning: could not return mirror to [0,0]")
-        
-        ## Turn off HV
-        if(self.is_HV_on):
-            if verbose: print("Turning HV off")
-            did_it_work = self.HV_off(verbose=False)
-            if not did_it_work:
-                print("Warning: could not turn HV off")  
-                
-        ## logout on driver
-        if verbose: print("Logging off:")
-        self.ser.write(b'MTI+EX\n')
-        sleep(self.sleep_time)
-        response = self.ser.readline()
-        if verbose: print(response.decode())
-            
-        ## Close serial connection
-        if (response == b'MTI-Device Exit Command Mode\r\n'):
-            self.ser.close()
-            if verbose: print("Disconnection successful")
+        self._require_ready()
+        self._exchange("MTI+EC")
+        return True
+
+    @_locked
+    def exit_safely(self, verbose=True, *, park=False):
+        """Disable then logout/close. Failed disable keeps the port open.
+
+        Parking is opt-in. Its failure still attempts disable and remains a
+        failure in the final report. Interruptions are re-raised after cleanup.
+        """
+        if self._shutdown_complete:
             return True
-        else:
-            print("Error: cannot exit command mode on device.  Keeping serial port open")
-            print("for manual debugging, the pyserial connection object is stored as self.ser")
+        errors, interrupted, disabled = [], None, False
+        try:
+            if park:
+                self._require_ready()
+                if self.is_HV_on is True:
+                    self.set_mirror_position(0, 0, verbose=False)
+        except BaseException as exc:
+            errors.append("Parking failed: " + str(exc))
+            if not isinstance(exc, Exception):
+                interrupted = exc
+        finally:
+            try:
+                disabled = self.HV_off(verbose=False)
+            except BaseException as exc:
+                errors.append("Disable failed: " + str(exc))
+                if not isinstance(exc, Exception):
+                    interrupted = interrupted or exc
+        evidence = self.output_state
+        if disabled:
+            try:
+                self._exchange("MTI+EX", kind="exit", emergency=True)
+                self.close()
+            except BaseException as exc:
+                errors.append("Logout/close failed: " + str(exc))
+                if not isinstance(exc, Exception):
+                    interrupted = interrupted or exc
+        self.last_shutdown_report = {
+            "success": disabled and not errors and not self.ser.is_open,
+            "disable_confirmed_at_protocol_level": disabled,
+            "disable_evidence": evidence,
+            "port_closed": not self.ser.is_open,
+            "errors": errors,
+            "output_voltage_measured": False,
+        }
+        self._shutdown_complete = self.last_shutdown_report["success"]
+        if verbose:
+            print(self.last_shutdown_report)
+        if interrupted is not None:
+            raise interrupted
+        return self._shutdown_complete
+
+    @_locked
+    def close(self):
+        """Release the serial port only; this does not disable hardware."""
+        try:
+            self.ser.close()
+        finally:
+            self._unknown("Port closed; current output state is not being observed")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            ok = self.exit_safely(verbose=False)
+        except BaseException as cleanup_error:
+            if exc is None:
+                raise
+            exc.add_note("MEMS cleanup failed: " + str(cleanup_error))
+            return False
+        if not ok:
+            message = "MEMS shutdown incomplete: " + str(self.last_shutdown_report)
+            if exc is not None:
+                exc.add_note(message)
+            else:
+                raise MEMSShutdownError(message)
         return False
